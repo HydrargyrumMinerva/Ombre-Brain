@@ -371,6 +371,41 @@ async def breath_hook(request):
     except Exception as e:
         logger.warning(f"Breath hook failed: {e}")
         return PlainTextResponse("")
+@mcp.custom_route("/api/hold-hook", methods=["POST"])
+async def hold_hook(request):
+    """REST endpoint for external services to write memories."""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    content = body.get("content", "").strip()
+    if not content:
+        return JSONResponse({"error": "empty content"}, status_code=400)
+
+    importance = max(1, min(10, body.get("importance", 5)))
+    tags_raw = body.get("tags", "")
+    extra_tags = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else []
+
+    try:
+        analysis = await dehydrator.analyze(content)
+    except Exception:
+        analysis = {"domain": ["未分类"], "valence": 0.5, "arousal": 0.3, "tags": [], "suggested_name": ""}
+
+    all_tags = list(dict.fromkeys(analysis.get("tags", []) + extra_tags))
+    result_name, is_merged = await _merge_or_create(
+        content=content,
+        tags=all_tags,
+        importance=importance,
+        domain=analysis.get("domain", ["未分类"]),
+        valence=analysis.get("valence", 0.5),
+        arousal=analysis.get("arousal", 0.3),
+        name=analysis.get("suggested_name", ""),
+    )
+
+    action = "合并" if is_merged else "新建"
+    return JSONResponse({"ok": True, "action": action, "name": result_name})
 
 
 # =============================================================
