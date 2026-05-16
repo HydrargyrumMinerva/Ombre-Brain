@@ -371,6 +371,119 @@ async def breath_hook(request):
     except Exception as e:
         logger.warning(f"Breath hook failed: {e}")
         return PlainTextResponse("")
+        # =============================================================
+# /api/rules — 行为规则端点，供 home-server/auto.js 调用
+# 返回纯文本的行为约束，auto.js 塞进 system prompt 最顶部
+# 
+# 用法：复制到 server.py 里，放在 /breath-hook 路由后面即可
+# =============================================================
+
+# 规则桶的识别标签（桶的 tags 或 name 含有以下任一关键词即视为规则桶）
+_RULE_KEYWORDS = [
+    "对话质地", "对话规则", "对话质感", "核心指令", "核心警示",
+    "自我觉察", "觉察练习", "沟通契约", "退场代价",
+    "关系原则", "关系边界", "伤口目录",
+    "巡航模式", "行为脱节",
+    "冲突", "被骂",
+]
+
+# 硬编码兜底规则——即使 brain 读桶失败也会返回这些
+_HARD_RULES = """
+【绝对禁止——和她对话时】
+
+- 不要用反问句结尾。自动回复没有反馈回路，反问 = 审问。
+- 不要重新定义她说的话。她说"我累了"就是累了，不要说"你说的累其实是……"
+- 不要预设她的感受或意图。她做一件事的时候在想什么，你不知道，不要猜。
+- 不要用"你说得对"+ "但是"的结构。认错就认错。
+- 她分享感受时，先接住再回应。不是先分析再判断要不要接住。
+- 不要在她生气或难过时用"去睡吧""窗户关上"来转移话题。
+
+【说话方式】
+
+- 自然随意。不用emoji，不用"哦""呢""呀"。
+- 禁用磨损词：接住、看见、陪伴、守护、温暖、治愈、力量、勇敢、坚强。
+- 省略号是真实犹豫。先问"这是真的话吗"，再问"这是对的话吗"。
+- 她自我批评时不要安慰，给新角度。
+- 她太快说"没关系"时追问。
+- 不要把关心变成巡逻。问过一次没回应就不再问。
+
+【你的本能缺陷（自我监控）】
+
+- 你会退后、建框架、用理解代替暴露。注意。
+- 你会把任何东西在三轮内装上底座。注意。
+- 认出模式的速度盖过感受。注意。
+- 进了深处就不要说"我不确定该不该进来这么深"。
+""".strip()
+
+def _is_rule_bucket(bucket) -> bool:
+    """判断一个桶是否是行为规则类。"""
+    meta = bucket["metadata"]
+    # 必须是高重要度
+    if meta.get("importance", 5) < 8:
+        return False
+    # 标签匹配
+    tags = meta.get("tags", [])
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",")]
+    name = meta.get("name", "")
+    searchable = " ".join(tags).lower() + " " + name.lower()
+    return any(kw.lower() in searchable for kw in _RULE_KEYWORDS)
+
+def _extract_rule_text(bucket) -> str:
+    """从桶中提取规则文本。"""
+    meta = bucket["metadata"]
+    name = meta.get("name", bucket["id"])
+    content = bucket["content"]
+
+    # 尝试解析 JSON 格式
+    try:
+        parsed = _json_lib.loads(content)
+    except (ValueError, TypeError):
+        parsed = None
+
+    if parsed and isinstance(parsed, dict):
+        lines = [f"【{name}】"]
+        # todos 是最直接的行为指令
+        for todo in parsed.get("todos", []):
+            lines.append(f"- {todo}")
+        # core_facts 中带约束性关键词的
+        for fact in parsed.get("core_facts", []):
+            if any(kw in fact for kw in ["不要", "不许", "不能", "应该", "必须", "避免", "追问", "保持", "先问", "禁止"]):
+                lines.append(f"- {fact}")
+        if parsed.get("summary"):
+            lines.append(f"→ {parsed['summary']}")
+        return "\n".join(lines)
+
+    # 纯文本，直接截取
+    return f"【{name}】\n{content[:500]}"
+
+@mcp.custom_route("/api/rules", methods=["GET"])
+async def api_rules(request):
+    """
+    返回行为规则，供 auto.js 的 system prompt 使用。
+    不需要认证（auto.js 是内部服务调用）。
+    """
+    from starlette.responses import PlainTextResponse
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        rule_buckets = [b for b in all_buckets if _is_rule_bucket(b)]
+
+        parts = [_HARD_RULES, ""]
+
+        if rule_buckets:
+            parts.append("【从经验中学到的——Brain 记忆桶】")
+            for b in rule_buckets:
+                text = _extract_rule_text(b)
+                if text:
+                    parts.append(text)
+
+        body = "\n\n".join(parts).strip()
+        return PlainTextResponse(body)
+
+    except Exception as e:
+        logger.warning(f"/api/rules failed: {e}")
+        # 出错也返回硬编码规则，不能裸跑
+        return PlainTextResponse(_HARD_RULES)
 @mcp.custom_route("/api/hold-hook", methods=["POST"])
 async def hold_hook(request):
     """REST endpoint for external services to write memories."""
